@@ -706,6 +706,7 @@ local function AssignCombat(blob)
 				blob.lastAngle = angle
 			end
 		end
+		blob.guardCircumfrence = 0
 		local theoryRadius = blob.radius + blob.guardDistance
 		-- calculate all angles
 		local emptyAngles = {}
