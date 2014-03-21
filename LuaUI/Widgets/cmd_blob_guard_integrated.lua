@@ -706,7 +706,6 @@ local function AssignCombat(blob)
 				blob.lastAngle = angle
 			end
 		end
-		blob.guardCircumfrence = 0
 		local theoryRadius = blob.radius + blob.guardDistance
 		-- calculate all angles
 		local emptyAngles = {}
@@ -757,7 +756,6 @@ local function AssignCombat(blob)
 					SlotGuard(guard, blob)
 				end
 			end
-			blob.guardDistance = max(100, ceil(blob.guardCircumfrence / 7.5))
 		else
 			-- if no slotting needed, just move guards to their slots
 			for gi, guard in pairs(blob.slotted) do
@@ -765,6 +763,7 @@ local function AssignCombat(blob)
 			end
 		end
 	end
+	blob.guardDistance = max(100, ceil(blob.guardCircumfrence / 7.5))
 	blob.needSlotting = false
 end
 
