@@ -78,7 +78,7 @@ local function ConstrainToMap(x, z)
 	return x, z
 end
 
-local function RandomAway(x, z, dist, angle)
+local function RadialAway(x, z, dist, angle)
 	if angle == nil then angle = random() * twicePi end
 	local nx = x + dist * cos(angle)
 	local nz = z - dist * sin(angle)
@@ -145,17 +145,9 @@ local function GetPrimaryWeaponRange(uDef)
 		end
 	end
 	if weapon then
-		--[[
-		local range = weapon["range"]
-		local reload = weapon["reload"]
-		local velocity = weapon["projectilespeed"] or 0
-		local hightrajectory = weapon["highTrajectory"]
-		local air = not weapon["canAttackGround"]
-		return range, reload, highestDPS, velocity, hightrajectory, air
-		]]--
 		return weapon["range"]
 	else
-		return 0, 0, 0, 0
+		return 0
 	end
 end
 
@@ -198,7 +190,11 @@ local function GetUnitObjectPosition(guardOrTarget)
 end
 
 local function NearestTargetID(guard)
-	local gx, gy, gz = GetUnitObjectPosition(guard)
+	local gx, gz = guard.theoryX, guard.theoryZ
+	if gx == nil then
+		local gy
+		gx, gy, gz = GetUnitObjectPosition(guard)
+	end
 	local targets = guard.blob.targets
 	local leastDist = 100000
 	local leastTarget
@@ -212,7 +208,7 @@ local function NearestTargetID(guard)
 		end
 	end
 	if leastTarget then
-		return leastTarget.unitID
+		return leastTarget.unitID, leastTarget
 	end
 end
 
@@ -565,10 +561,15 @@ local function EvaluateTargets(blob)
 		blob.speed = maxVectorSize * period
 		local dx = maxX - minX
 		local dz = maxZ - minZ
+		local ratio = abs(dx) / abs(dz)
+		blob.rectangleFit = ratio < 0.618 or ratio > 1.618
+		blob.minX, blob.minZ, blob.maxX, blob.maxZ = minX, minZ, maxX, maxZ
+		blob.dx, blob.dz = dx, dz
 		blob.radius = (Pythagorean(dx, dz) / 2) + (maxTargetSize / 2)
 		blob.x = (maxX + minX) / 2
 		blob.z = (maxZ + minZ) / 2
 	else
+		blob.rectangleFit = false
 		blob.x, blob.y, blob.z = GetUnitObjectPosition(blob.targets[1])
 		blob.vx, blob.vy, blob.vz = Spring.GetUnitVelocity(blob.targets[1].unitID)
 		blob.radius = blob.targets[1].size / 2
@@ -641,7 +642,7 @@ local function EvaluateGuards(blob)
 	end
 end
 
-local function SlotGuard(guard, blob, ax, az, guardDist)
+local function SlotGuard(guard, blob)
 	blob.guardCircumfrence = blob.guardCircumfrence + guard.size
 	local attacking
 	local cmdQueue = Spring.GetUnitCommands(guard.unitID, 1)
@@ -657,12 +658,22 @@ local function SlotGuard(guard, blob, ax, az, guardDist)
 		end
 	end
 	-- move into position if needed
-	if guardDist == nil then guardDist = blob.radius + blob.guardDistance end
-	if ax == nil then ax, az = RandomAway(blob.x, blob.z, guardDist, guard.angle) end
-	local slotDist = Distance(guard.x, guard.z, ax, az)
+	guard.theoryX, guard.theoryZ = RadialAway(blob.x, blob.z, blob.radius, guard.angle)
+	local tID, target = NearestTargetID(guard)
+	local tx, ty, tz
+	if target then
+		tx, ty, tz = GetUnitObjectPosition(target)
+		tx, tz = ApplyVector(tx, tz, blob.vx, blob.vz)
+		guard.currentWardID = tID
+	else
+		tx, ty, tz = guard.theoryX, 0, guard.theoryZ
+	end
+	local tax, taz = RadialAway(tx, tz, blob.guardDistance, guard.angle)
+	local gx, gy, gz = GetUnitObjectPosition(guard)
+	local slotDist = Distance(gx, gz, tax, taz)
 	if slotDist > maxDist then
-		local ay = Spring.GetGroundHeight(ax, az)
-		GiveCommand(guard.unitID, CMD.MOVE, {ax, ay, az})
+		local tay = Spring.GetGroundHeight(tax, taz)
+		GiveCommand(guard.unitID, CMD.MOVE, {tax, tay, taz})
 	end
 end
 
@@ -695,24 +706,26 @@ local function AssignCombat(blob)
 				blob.lastAngle = angle
 			end
 		end
-		local guardDist = blob.radius + blob.guardDistance
-		if blob.underFire then guardDist = blob.radius + (blob.guardDistance * 0.5) end
 		blob.guardCircumfrence = 0
+		local theoryRadius = blob.radius + blob.guardDistance
 		local emptyAngles = {}
 		-- calculate all angles and assign to unslotted first
 		for i = 1, divisor do
 			local guard
-			local ax, az
 			if blob.needSlotting then
 				-- if we need to reslot, find the nearest unslotted guard to this angle
 				local a = angle + (angleAdd * (i - 1))
 				if a > twicePi then a = a - twicePi end
 				if #blob.willSlot > 0 then
-					ax, az = RandomAway(blob.x, blob.z, guardDist, a)
+					local theoryX, theoryZ = RadialAway(blob.x, blob.z, theoryRadius, a)
 					local leastDist = 10000
 					local bestGuard = 1
 					for gi, g in pairs(blob.willSlot) do
-						local dist = Distance(g.x, g.z, ax, az)
+						local gx, gz = GetUnitObjectPosition(g)
+						-- local ga = AngleAtoB(blob.x, blob.z, gx, gz)
+						-- local angleDist = AngleDist(ga, a)
+						-- local dist = 2 * abs(sin(angleDist / 2)) * theoryRadius
+						local dist = Distance(gx, gz, theoryX, theoryZ)
 						if dist < leastDist then
 							leastDist = dist
 							bestGuard = gi
@@ -726,16 +739,15 @@ local function AssignCombat(blob)
 			else
 				guard = table.remove(blob.slotted)
 			end
-			if guard ~= nil then SlotGuard(guard, blob, ax, az, guardDist) end
+			if guard ~= nil then SlotGuard(guard, blob) end
 		end
 		-- assign the rest to already slotted
 		for i, a in pairs(emptyAngles) do
-			local ax, az = RandomAway(blob.x, blob.z, guardDist, a)
 			local leastDist = 10000
 			local bestGuard = 1
 			for gi, g in pairs(blob.slotted) do
 				local angleDist = AngleDist(g.angle, a)
-				local dist = 2 * abs(sin(angleDist / 2)) * guardDist
+				local dist = 2 * abs(sin(angleDist / 2)) * theoryRadius
 				if dist < leastDist then
 					leastDist = dist
 					bestGuard = gi
@@ -743,7 +755,9 @@ local function AssignCombat(blob)
 			end
 			local guard = table.remove(blob.slotted, bestGuard)
 			guard.angle = a
-			if guard ~= nil then SlotGuard(guard, blob, ax, az, guardDist) end
+			if guard ~= nil then
+				SlotGuard(guard, blob)
+			end
 		end
 		blob.guardDistance = max(100, ceil(blob.guardCircumfrence / 7.5))
 	end
@@ -906,8 +920,7 @@ function widget:UnitCmdDone(unitID, unitDefID, unitTeam, cmdID, cmdTag, cmdParam
 		if ClearWidgetCommand(unitID, cmdID, cmdParams) then
 			if #cmdParams == 3 and not removed then
 				-- insert a guard order following the move order
-				local tID = NearestTargetID(guard)
-				local params = {0, CMD.GUARD, CMD.OPT_RIGHT, tID}
+				local tID = guard.currentWardID or NearestTargetID(guard)
 				SendInsertCommand(unitID, CMD.GUARD, {tID}, 0)
 			end
 		end
