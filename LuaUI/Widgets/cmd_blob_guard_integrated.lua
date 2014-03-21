@@ -182,7 +182,7 @@ end
 
 local function GetUnitObjectPosition(guardOrTarget)
 	local f = Spring.GetGameFrame()
-	if guardOrTarget.x == nil or guardOrTarget.lastGotPosition == nil or f > guardOrTarget.lastGotPosition + period - 1 then
+	if guardOrTarget.x == nil or guardOrTarget.lastGotPosition == nil or f > guardOrTarget.lastGotPosition then
 		guardOrTarget.x, guardOrTarget.y, guardOrTarget.z = Spring.GetUnitPosition(guardOrTarget.unitID)
 		guardOrTarget.lastGotPosition = f
 	end
@@ -708,58 +708,62 @@ local function AssignCombat(blob)
 		end
 		blob.guardCircumfrence = 0
 		local theoryRadius = blob.radius + blob.guardDistance
+		-- calculate all angles
 		local emptyAngles = {}
-		-- calculate all angles and assign to unslotted first
-		for i = 1, divisor do
-			local guard
-			if blob.needSlotting then
-				-- if we need to reslot, find the nearest unslotted guard to this angle
+		if blob.needSlotting then
+			for i = 1, divisor do
 				local a = angle + (angleAdd * (i - 1))
 				if a > twicePi then a = a - twicePi end
-				if #blob.willSlot > 0 then
-					local theoryX, theoryZ = RadialAway(blob.x, blob.z, theoryRadius, a)
-					local leastDist = 10000
-					local bestGuard = 1
-					for gi, g in pairs(blob.willSlot) do
-						local gx, gz = GetUnitObjectPosition(g)
-						-- local ga = AngleAtoB(blob.x, blob.z, gx, gz)
-						-- local angleDist = AngleDist(ga, a)
-						-- local dist = 2 * abs(sin(angleDist / 2)) * theoryRadius
-						local dist = Distance(gx, gz, theoryX, theoryZ)
-						if dist < leastDist then
-							leastDist = dist
-							bestGuard = gi
-						end
-					end
-					guard = table.remove(blob.willSlot, bestGuard)
-					guard.angle = a
-				else
-					table.insert(emptyAngles, a)
-				end
-			else
-				guard = table.remove(blob.slotted)
+				local theoryX, theoryZ = RadialAway(blob.x, blob.z, theoryRadius, a)
+				table.insert(emptyAngles, {angle = a, theoryX = theoryX, theoryZ = theoryZ})
 			end
-			if guard ~= nil then SlotGuard(guard, blob) end
 		end
-		-- assign the rest to already slotted
-		for i, a in pairs(emptyAngles) do
-			local leastDist = 10000
-			local bestGuard = 1
-			for gi, g in pairs(blob.slotted) do
-				local angleDist = AngleDist(g.angle, a)
-				local dist = 2 * abs(sin(angleDist / 2)) * theoryRadius
+		-- assign unslotted first
+		for gi, guard in pairs(blob.willSlot) do
+			local bestAngleIndex
+			local leastDist = 100000
+			for aIndex = 1, #emptyAngles do
+				local a = emptyAngles[aIndex]
+				local gx, gy, gz = GetUnitObjectPosition(guard)
+				local dist = Distance(gx, gz, a.theoryX, a.theoryZ)
 				if dist < leastDist then
 					leastDist = dist
-					bestGuard = gi
+					bestAngleIndex = aIndex
 				end
 			end
-			local guard = table.remove(blob.slotted, bestGuard)
-			guard.angle = a
-			if guard ~= nil then
+			if bestAngleIndex ~= nil then
+				local bestA = table.remove(emptyAngles, bestAngleIndex)
+				guard.angle = bestA.angle
 				SlotGuard(guard, blob)
 			end
 		end
-		blob.guardDistance = max(100, ceil(blob.guardCircumfrence / 7.5))
+		-- assign the rest to already slotted
+		if blob.needSlotting then
+			for aIndex = 1, #emptyAngles do
+				local a = emptyAngles[aIndex]
+				local leastDist = 10000
+				local bestGuard = 1
+				for gi, g in pairs(blob.slotted) do
+					local angleDist = AngleDist(g.angle, a.angle)
+					local dist = 2 * abs(sin(angleDist / 2)) * theoryRadius
+					if dist < leastDist then
+						leastDist = dist
+						bestGuard = gi
+					end
+				end
+				local guard = table.remove(blob.slotted, bestGuard)
+				guard.angle = a.angle
+				if guard ~= nil then
+					SlotGuard(guard, blob)
+				end
+			end
+			blob.guardDistance = max(100, ceil(blob.guardCircumfrence / 7.5))
+		else
+			-- if no slotting needed, just move guards to their slots
+			for gi, guard in pairs(blob.slotted) do
+				SlotGuard(guard, blob)
+			end
+		end
 	end
 	blob.needSlotting = false
 end
