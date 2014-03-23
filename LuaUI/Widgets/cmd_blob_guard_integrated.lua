@@ -189,13 +189,14 @@ local function GetUnitObjectPosition(guardOrTarget)
 	return guardOrTarget.x, guardOrTarget.y, guardOrTarget.z
 end
 
-local function NearestTargetID(guard)
-	local gx, gz = guard.theoryX, guard.theoryZ
-	if gx == nil then
-		local gy
+local function NearestTargetID(guard, gx, gz, blob)
+	local gy
+	if guard ~= nil and gx == nil then gx, gz = guard.theoryX, guard.theoryZ end
+	if guard ~= nil and gx == nil then
 		gx, gy, gz = GetUnitObjectPosition(guard)
 	end
-	local targets = guard.blob.targets
+	if guard ~= nil and blob == nil then blob = guard.blob end
+	local targets = blob.targets
 	local leastDist = 100000
 	local leastTarget
 	for i = 1, #targets do
@@ -561,10 +562,10 @@ local function EvaluateTargets(blob)
 		blob.speed = maxVectorSize * period
 		local dx = maxX - minX
 		local dz = maxZ - minZ
-		local ratio = abs(dx) / abs(dz)
-		blob.rectangleFit = ratio < 0.618 or ratio > 1.618
+		local ratio = dx / dz
+		blob.rectangleFit = ratio < 0.5 or ratio > 2
 		blob.minX, blob.minZ, blob.maxX, blob.maxZ = minX, minZ, maxX, maxZ
-		blob.dx, blob.dz = dx, dz
+		blob.rectangleLength, blob.rectLenX, blob.rectLenZ = (dx * 2) + (dz * 2), dx, dz
 		blob.radius = (Pythagorean(dx, dz) / 2) + (maxTargetSize / 2)
 		blob.x = (maxX + minX) / 2
 		blob.z = (maxZ + minZ) / 2
@@ -589,6 +590,7 @@ local function EvaluateGuards(blob)
 	for gi, guard in pairs(blob.guards) do
 		local unitID = guard.unitID
 		if guard.isCombatant and guard.speed > blob.speed then
+			if blob.lastRectangleFit ~= blob.rectangleFit then guard.angle = nil end
 			local gx, gy, gz = GetUnitObjectPosition(guard)
 			local dist = Distance(blob.x, blob.z, gx, gz)
 			if dist > blob.radius + (blob.guardDistance * 3) then
@@ -642,7 +644,37 @@ local function EvaluateGuards(blob)
 	end
 end
 
-local function SlotGuard(guard, blob)
+local function PointAlongRectangle(blob, fraction)
+	-- find which segment
+	local length = fraction * blob.rectangleLength
+	local cornerX, cornerZ, remainingLength, multX, multZ
+	if length > blob.rectLenX then
+		if length > blob.rectLenX + blob.rectLenZ then
+			if length > (blob.rectLenX * 2) + blob.rectLenZ then
+				cornerX, cornerZ = blob.minX, blob.maxZ
+				remainingLength = length - ((blob.rectLenX * 2) + blob.rectLenZ)
+				multX, multZ = 0, -1
+			else
+				cornerX, cornerZ = blob.maxX, blob.maxZ
+				remainingLength = length - (blob.rectLenX + blob.rectLenZ)
+				multX, multZ = -1, 0
+			end
+		else
+			cornerX, cornerZ = blob.maxX, blob.minZ
+			remainingLength = length - (blob.rectLenX)
+			multX, multZ = 0, 1
+		end
+	else
+		cornerX, cornerZ = blob.minX, blob.minZ
+		remainingLength = length
+		multX, multZ = 1, 0
+	end
+	-- return where along segment (how far in which direction from corner)
+	return cornerX + (multX * remainingLength), cornerZ + (multZ * remainingLength), multX, multZ
+end
+
+local function SlotGuard(guard, rectangular, tax, taz, slotDist)
+	local blob = guard.blob
 	blob.guardCircumfrence = blob.guardCircumfrence + guard.size
 	local attacking
 	local cmdQueue = Spring.GetUnitCommands(guard.unitID, 1)
@@ -657,20 +689,36 @@ local function SlotGuard(guard, blob)
 			maxDist = ((guard.range * 0.5) + guard.speed)
 		end
 	end
-	-- move into position if needed
-	guard.theoryX, guard.theoryZ = RadialAway(blob.x, blob.z, blob.radius, guard.angle)
-	local tID, target = NearestTargetID(guard)
-	local tx, ty, tz
-	if target then
-		tx, ty, tz = GetUnitObjectPosition(target)
-		tx, tz = ApplyVector(tx, tz, blob.vx, blob.vz)
-		guard.currentWardID = tID
-	else
-		tx, ty, tz = guard.theoryX, 0, guard.theoryZ
+	-- calculate position of slot if needed
+	if tax == nil then
+		local multX, multZ, perpX, perpZ
+		if rectangular then
+			guard.theoryX, guard.theoryZ, multX, multZ = PointAlongRectangle(blob, guard.angle)
+			perpX, perpZ = multZ, -multX
+		else
+			guard.theoryX, guard.theoryZ = RadialAway(blob.x, blob.z, blob.radius, guard.angle)
+		end
+		local tID, target = NearestTargetID(guard)
+		local tx, ty, tz
+		if target then
+			tx, ty, tz = GetUnitObjectPosition(target)
+			tx, tz = ApplyVector(tx, tz, blob.vx, blob.vz)
+			guard.currentWardID = tID
+		else
+			tx, ty, tz = guard.theoryX, 0, guard.theoryZ
+		end
+		if rectangular then
+			tax, taz = tx + (perpX * blob.guardDistance), tz + (perpZ * blob.guardDistance)
+		else
+			tax, taz = RadialAway(tx, tz, blob.guardDistance, guard.angle)
+		end
 	end
-	local tax, taz = RadialAway(tx, tz, blob.guardDistance, guard.angle)
-	local gx, gy, gz = GetUnitObjectPosition(guard)
-	local slotDist = Distance(gx, gz, tax, taz)
+	-- how far is guard from slot?
+	if slotDist == nil then
+		local gx, gy, gz = GetUnitObjectPosition(guard)
+		slotDist = Distance(gx, gz, tax, taz)
+	end
+	-- move into position if needed
 	if slotDist > maxDist then
 		local tay = Spring.GetGroundHeight(tax, taz)
 		GiveCommand(guard.unitID, CMD.MOVE, {tax, tay, taz})
@@ -680,12 +728,13 @@ end
 local function AssignCombat(blob)
 	-- find angle slots if needed and move units to them
 	local divisor = #blob.slotted + #blob.willSlot
+	blob.guardCircumfrence = 0
 	if divisor > 0 then
 		if divisor < 3 and (blob.lastVX ~= blob.vx or blob.lastVZ ~= blob.vz) then blob.needSlotting = true end -- one or two guards should guard in front of unit first
-		local angleAdd, angle
 		if blob.needSlotting then
-			-- if we need to reslot, get a starting angle and division
-			angleAdd = twicePi / divisor
+			-- if we need to reslot, get a starting angle
+			local angleAdd = twicePi / divisor
+			local angle
 			if divisor < 3 and (blob.speed > 0) then 
 				 -- one or two guards should guard in front of unit first
 				angle = atan2(-blob.vz, blob.vx)
@@ -705,40 +754,45 @@ local function AssignCombat(blob)
 				angle = random() * twicePi
 				blob.lastAngle = angle
 			end
-		end
-		blob.guardCircumfrence = 0
-		local theoryRadius = blob.radius + blob.guardDistance
-		-- calculate all angles
-		local emptyAngles = {}
-		if blob.needSlotting then
+			local theoryRadius = blob.radius + blob.guardDistance
+			-- calculate all angles
+			local emptyAngles = {}
 			for i = 1, divisor do
 				local a = angle + (angleAdd * (i - 1))
 				if a > twicePi then a = a - twicePi end
 				local theoryX, theoryZ = RadialAway(blob.x, blob.z, theoryRadius, a)
-				table.insert(emptyAngles, {angle = a, theoryX = theoryX, theoryZ = theoryZ})
+				local tID, target = NearestTargetID(nil, theoryX, theoryZ, blob)
+				local tx, ty, tz
+				if target then
+					tx, ty, tz = GetUnitObjectPosition(target)
+					tx, tz = ApplyVector(tx, tz, blob.vx, blob.vz)
+				else
+					tx, ty, tz = theoryX, 0, theoryZ
+				end
+				local tax, taz = RadialAway(tx, tz, blob.guardDistance, a)
+				table.insert(emptyAngles, {angle = a, targetID = tID, theoryX = tax, theoryZ = taz})
 			end
-		end
-		-- assign unslotted first
-		for gi, guard in pairs(blob.willSlot) do
-			local bestAngleIndex
-			local leastDist = 100000
-			for aIndex = 1, #emptyAngles do
-				local a = emptyAngles[aIndex]
-				local gx, gy, gz = GetUnitObjectPosition(guard)
-				local dist = Distance(gx, gz, a.theoryX, a.theoryZ)
-				if dist < leastDist then
-					leastDist = dist
-					bestAngleIndex = aIndex
+			-- assign unslotted first
+			for gi, guard in pairs(blob.willSlot) do
+				local bestAngleIndex
+				local leastDist = 100000
+				for aIndex = 1, #emptyAngles do
+					local a = emptyAngles[aIndex]
+					local gx, gy, gz = GetUnitObjectPosition(guard)
+					local dist = Distance(gx, gz, a.theoryX, a.theoryZ)
+					if dist < leastDist then
+						leastDist = dist
+						bestAngleIndex = aIndex
+					end
+				end
+				if bestAngleIndex ~= nil then
+					local bestA = table.remove(emptyAngles, bestAngleIndex)
+					guard.angle = bestA.angle
+					guard.currentWardID = bestA.targetID
+					SlotGuard(guard, false, bestA.tax, bestA.taz, leastDist)
 				end
 			end
-			if bestAngleIndex ~= nil then
-				local bestA = table.remove(emptyAngles, bestAngleIndex)
-				guard.angle = bestA.angle
-				SlotGuard(guard, blob)
-			end
-		end
-		-- assign the rest to already slotted
-		if blob.needSlotting then
+			-- assign the rest to already slotted
 			for aIndex = 1, #emptyAngles do
 				local a = emptyAngles[aIndex]
 				local leastDist = 10000
@@ -752,15 +806,98 @@ local function AssignCombat(blob)
 					end
 				end
 				local guard = table.remove(blob.slotted, bestGuard)
-				guard.angle = a.angle
 				if guard ~= nil then
-					SlotGuard(guard, blob)
+					guard.angle = a.angle
+					guard.currentWardID = a.targetID
+					SlotGuard(guard, false, a.tax, a.taz, leastDist)
 				end
 			end
 		else
 			-- if no slotting needed, just move guards to their slots
 			for gi, guard in pairs(blob.slotted) do
-				SlotGuard(guard, blob)
+				SlotGuard(guard, false)
+			end
+		end
+	end
+	blob.guardDistance = max(100, ceil(blob.guardCircumfrence / 7.5))
+	blob.needSlotting = false
+end
+
+-- used when blob is long/tall and skinny, and has more than 2 combat guards
+local function AssignCombatRectangular(blob)
+	if blob.lastRectLenX then
+		if blob.rectLenX - 10 > blob.lastRectLenX or blob.rectLenX + 10 < blob.lastRectLenX or blob.rectLenZ - 10 > blob.lastRectLenZ or blob.rectLenZ + 10 < blob.lastRectLenZ then blob.needSlotting = true end
+	end
+	local divisor = #blob.slotted + #blob.willSlot
+	blob.guardCircumfrence = 0
+	if divisor > 2 then
+		if blob.needSlotting then
+			-- if we need to reslot, get a starting angle
+			local fracAdd = 1 / divisor
+			local startFraction = (math.min(blob.rectLenX, blob.rectLenZ) / 2) / blob.rectangleLength
+			if blob.rectLenX > blob.rectLenZ then startFraction = startFraction + (blob.rectLenX / blob.rectangleLength) end
+			-- calculate all slot positions
+			local emptySlots = {}
+			for i = 1, divisor do
+				local f = startFraction + (fracAdd * (i - 1))
+				if f > 1 then f = f - 1 end
+				local theoryX, theoryZ, multX, multZ  = PointAlongRectangle(blob, f)
+				local perpX, perpZ = multZ, -multX
+				local tID, target = NearestTargetID(nil, theoryX, theoryZ, blob)
+				local tx, ty, tz
+				if target then
+					tx, ty, tz = GetUnitObjectPosition(target)
+					tx, tz = ApplyVector(tx, tz, blob.vx, blob.vz)
+				else
+					tx, ty, tz = theoryX, 0, theoryZ
+				end
+				local tax, taz = tx + (perpX * blob.guardDistance), tz + (perpZ * blob.guardDistance)
+				table.insert(emptySlots, {fraction = f, targetID = tID, theoryX = tax, theoryZ = taz})
+			end
+			-- assign unslotted first
+			for gi, guard in pairs(blob.willSlot) do
+				local bestSlotIndex
+				local leastDist = 100000
+				for sIndex = 1, #emptySlots do
+					local s = emptySlots[sIndex]
+					local gx, gy, gz = GetUnitObjectPosition(guard)
+					local dist = Distance(gx, gz, s.theoryX, s.theoryZ)
+					if dist < leastDist then
+						leastDist = dist
+						bestSlotIndex = sIndex
+					end
+				end
+				if bestSlotIndex ~= nil then
+					local bestSlot = table.remove(emptySlots, bestSlotIndex)
+					guard.angle = bestSlot.fraction
+					guard.currentWardID = bestSlot.targetID
+					SlotGuard(guard, true, bestSlot.theoryX, bestSlot.theoryZ, leastDist)
+				end
+			end
+			-- assign the rest to already slotted
+			for sIndex = 1, #emptySlots do
+				local s = emptySlots[sIndex]
+				local leastDist = 100000
+				local bestGuard = 1
+				for gi, g in pairs(blob.slotted) do
+					local gx, gy, gz = GetUnitObjectPosition(g)
+					local dist = Distance(gx, gz, s.theoryX, s.theoryZ)
+					if dist < leastDist then
+						leastDist = dist
+						bestGuard = gi
+					end
+				end
+				local guard = table.remove(blob.slotted, bestGuard)
+				if guard ~= nil then
+					guard.angle = s.fraction
+					guard.currentWardID = s.targetID
+					SlotGuard(guard, true, s.theoryX, s.theoryZ, leastDist)
+				end
+			end
+		else
+			-- if no slotting needed, just move guards to their slots
+			for gi, guard in pairs(blob.slotted) do
+				SlotGuard(guard, true)
 			end
 		end
 	end
@@ -975,7 +1112,11 @@ function widget:GameFrame(gameFrame)
 			end
 			EvaluateTargets(blob) -- find blob position and minimum blob radius and who needs repair and assisting
 			EvaluateGuards(blob) -- find which guards need to do what
-			AssignCombat(blob) -- put combatant guards into circle slots
+			if blob.rectangleFit and (#blob.slotted + #blob.willSlot) > 2 then
+				AssignCombatRectangular(blob) -- put combatant guards into rectangle slots
+			else
+				AssignCombat(blob) -- put combatant guards into circle slots
+			end
 			AssignAssist(blob)
 			AssignRepair(blob)
 			AssignRemaining(blob)
@@ -985,6 +1126,9 @@ function widget:GameFrame(gameFrame)
 				blob.expansionRate = (blob.radius - blob.lastRadius) / period
 			end
 			blob.lastRadius = blob.radius + 0
+			blob.lastRectangleFit = blob.rectangleFit
+			blob.lastRectLenX = blob.rectLenX
+			blob.lastRectLenZ = blob.rectLenZ
 		end
 		lastCalcFrame = gameFrame
 	end
